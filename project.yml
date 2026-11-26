@@ -113,10 +113,9 @@ targets:
         # or a swapped download cannot install code. Losing the private key
         # means no existing install can ever be updated again — back it up.
         SUPublicEDKey: rmUfT5r49nR+3HdkbR5/YYLghfnAi6L49eOk3sIegSk=
-        # Set explicitly so Sparkle never asks on first launch. Left unset, it
-        # shows a "check for updates automatically?" prompt, which is exactly
-        # the permission this is meant to avoid.
-        SUEnableAutomaticChecks: true
+        # Disabled in this custom fork so Sparkle does not overwrite the local
+        # agy-CLI-only build with upstream releases.
+        SUEnableAutomaticChecks: false
         # Never downloads unasked: a new version is offered in the notch and
         # installed when Update is chosen — see `Updater`.
         SUAutomaticallyUpdate: false

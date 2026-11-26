@@ -1499,11 +1499,12 @@ final class Preferences: ObservableObject {
         menuBarProviders = menuBarLimits.choosing(shown, providerID, among: listed).chosen
     }
 
-    /// Claude and Codex stay on for a first install and for a newly discovered
-    /// profile. Everyone else starts off.
+    /// Claude, Codex, and isolated T3 Code Antigravity profiles stay on for a
+    /// first install and for newly discovered profiles. Everyone else starts off.
     nonisolated static func isDefaultOnFamily(_ providerID: String) -> Bool {
         ClaudeProfile.isClaude(providerID: providerID)
             || CodexProfile.isCodex(providerID: providerID)
+            || AntigravityProfile.isT3Code(providerID: providerID)
     }
 
     /// Model cells are `providerID:model:…`. A new loaded model is not a new

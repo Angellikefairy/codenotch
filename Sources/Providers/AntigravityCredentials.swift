@@ -264,6 +264,11 @@ struct AntigravityCredentials: Equatable {
 
     static func hasCredential(for profile: AntigravityProfile) -> Bool {
         if profile.slug == nil { return isSignedIn() }
+        if let tokenURL = profile.cliTokenFileURL, FileManager.default.fileExists(atPath: tokenURL.path) {
+            return true
+        }
+        let localCliToken = profile.configDirectory.appendingPathComponent("antigravity-oauth-token").path
+        if FileManager.default.fileExists(atPath: localCliToken) { return true }
         if FileManager.default.fileExists(atPath: profile.authURL.path) { return true }
         let dbPath = profile.configDirectory.appendingPathComponent("agent.db").path
         if FileManager.default.fileExists(atPath: dbPath), readOMPCredentials(at: URL(fileURLWithPath: dbPath)) != nil {

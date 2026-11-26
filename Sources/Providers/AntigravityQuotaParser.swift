@@ -26,28 +26,72 @@ enum AntigravityQuotaParser {
     }
 
     private struct Bucket: Decodable {
+        let id: String?
         let modelId: String?
         let bucketId: String?
         let name: String?
         let displayName: String?
         let remainingFraction: Double?
+        let remainingFractionSnake: Double?
         let remaining: Remaining?
         let used: Double?
         let limit: Double?
         let resetTime: String?
+        let resetTimeSnake: String?
         let window: String?
         let disabled: Bool?
 
-        var fraction: Double? { self.remainingFraction ?? self.remaining?.fraction }
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case modelId
+            case bucketId
+            case name
+            case displayName
+            case remainingFraction
+            case remainingFractionSnake = "remaining_fraction"
+            case remaining
+            case used
+            case limit
+            case resetTime
+            case resetTimeSnake = "reset_time"
+            case window
+            case disabled
+        }
+
+        var fraction: Double? {
+            self.remainingFraction ?? self.remainingFractionSnake ?? self.remaining?.fraction
+        }
+
+        var effectiveResetTime: String? {
+            self.resetTime ?? self.resetTimeSnake
+        }
+
+        var effectiveBucketID: String? {
+            self.bucketId ?? self.id
+        }
+
+        var effectiveDisplayName: String? {
+            self.displayName ?? self.name
+        }
     }
 
     private struct Group: Decodable {
         let displayName: String?
+        let name: String?
         let buckets: [Bucket]?
+
+        var effectiveName: String? {
+            self.displayName ?? self.name
+        }
     }
 
     private struct GroupBody: Decodable {
         let groups: [Group]?
+    }
+
+    private struct CLICommand: Decodable {
+        let name: String?
+        let data: GroupBody?
     }
 
     private struct Response: Decodable {
@@ -56,6 +100,23 @@ enum AntigravityQuotaParser {
         let quotaGroups: [Group]?
         let response: GroupBody?
         let summary: GroupBody?
+        let command: CLICommand?
+
+        private enum CodingKeys: String, CodingKey {
+            case buckets, groups, quotaGroups, response, summary, command
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.buckets = try? container.decodeIfPresent([Bucket].self, forKey: .buckets)
+            self.groups = try? container.decodeIfPresent([Group].self, forKey: .groups)
+            self.quotaGroups = try? container.decodeIfPresent([Group].self, forKey: .quotaGroups)
+            // Official `agy -p /usage --output-format json` puts a plain text string in
+            // `"response"` while the structured groups live under `"command.data.groups"`.
+            self.response = try? container.decodeIfPresent(GroupBody.self, forKey: .response)
+            self.summary = try? container.decodeIfPresent(GroupBody.self, forKey: .summary)
+            self.command = try? container.decodeIfPresent(CLICommand.self, forKey: .command)
+        }
     }
 
     private struct Candidate {
@@ -66,7 +127,8 @@ enum AntigravityQuotaParser {
 
     static func parse(_ data: Data, now: Date) -> [LimitWindow] {
         guard let response = try? JSONDecoder().decode(Response.self, from: data) else { return [] }
-        let groups = response.response?.groups
+        let groups = response.command?.data?.groups
+            ?? response.response?.groups
             ?? response.summary?.groups
             ?? response.groups
             ?? response.quotaGroups
@@ -81,8 +143,8 @@ enum AntigravityQuotaParser {
 
     private static func groupedWindows(_ groups: [Group]) -> [LimitWindow] {
         let sortedGroups = groups.enumerated().sorted { lhs, rhs in
-            let lhsRank = self.groupRank(lhs.element.displayName)
-            let rhsRank = self.groupRank(rhs.element.displayName)
+            let lhsRank = self.groupRank(lhs.element.effectiveName)
+            let rhsRank = self.groupRank(rhs.element.effectiveName)
             return lhsRank == rhsRank ? lhs.offset < rhs.offset : lhsRank < rhsRank
         }
         var windows: [LimitWindow] = []
@@ -101,9 +163,9 @@ enum AntigravityQuotaParser {
         return sortedBuckets.compactMap { indexedBucket in
             let bucket = indexedBucket.element
             guard bucket.disabled != true else { return nil }
-            let groupName = group.displayName
+            let groupName = group.effectiveName
             let rawID = self.id(for: bucket, group: groupName)
-            let reset = bucket.resetTime.flatMap(AntigravityCredentials.parse)
+            let reset = self.parseResetTime(bucket.effectiveResetTime)
             if let remaining = bucket.fraction, (0...1).contains(remaining) {
                 return LimitWindow(
                     id: rawID,
@@ -124,6 +186,14 @@ enum AntigravityQuotaParser {
                 resetsAt: reset,
                 duration: self.duration(for: bucket))
         }
+    }
+
+    /// Official `agy -p /usage` emits `1970-01-01T00:00:00Z` for untouched
+    /// buckets whose rolling window has not started yet. Treat epoch zero as
+    /// no reset date so the UI never displays a 1970 timestamp.
+    private static func parseResetTime(_ raw: String?) -> Date? {
+        guard let raw, let date = AntigravityCredentials.parse(raw) else { return nil }
+        return date.timeIntervalSince1970 > 0 ? date : nil
     }
 
     private static func legacyWindows(_ buckets: [Bucket]) -> [LimitWindow] {
@@ -223,11 +293,11 @@ enum AntigravityQuotaParser {
 
     private static func cadence(_ bucket: Bucket) -> Int {
         if let value = self.cadenceValue(bucket.window), self.isWeeklyValue(value) { return 1 }
-        if let value = self.cadenceValue(bucket.bucketId), self.isWeeklyValue(value) { return 1 }
-        if let value = self.cadenceValue(bucket.displayName), self.isWeeklyValue(value) { return 1 }
+        if let value = self.cadenceValue(bucket.effectiveBucketID), self.isWeeklyValue(value) { return 1 }
+        if let value = self.cadenceValue(bucket.effectiveDisplayName), self.isWeeklyValue(value) { return 1 }
         if let value = self.cadenceValue(bucket.window), self.isSessionValue(value) { return 0 }
-        if let value = self.cadenceValue(bucket.bucketId), self.isSessionValue(value) { return 0 }
-        if let value = self.cadenceValue(bucket.displayName), self.isSessionValue(value) { return 0 }
+        if let value = self.cadenceValue(bucket.effectiveBucketID), self.isSessionValue(value) { return 0 }
+        if let value = self.cadenceValue(bucket.effectiveDisplayName), self.isSessionValue(value) { return 0 }
         return 2
     }
 
@@ -262,7 +332,7 @@ enum AntigravityQuotaParser {
     /// so the ones it is known to send are looked up in the catalog. Any other
     /// name is shown as the server spelled it.
     private static func label(for bucket: Bucket, fallback: String) -> String {
-        var value = bucket.displayName ?? fallback
+        var value = bucket.effectiveDisplayName ?? fallback
         if value.hasSuffix(" Remaining") {
             value = String(value.dropLast(" Remaining".count))
         }
@@ -284,7 +354,7 @@ enum AntigravityQuotaParser {
     }
 
     private static func id(for bucket: Bucket, group: String?) -> String {
-        [bucket.bucketId, bucket.modelId, bucket.name, group]
+        [bucket.effectiveBucketID, bucket.modelId, bucket.name, group]
             .compactMap { value in
                 guard let value else { return nil }
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

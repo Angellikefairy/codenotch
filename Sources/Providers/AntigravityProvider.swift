@@ -22,13 +22,6 @@ actor AntigravityProvider: UsageProvider {
     nonisolated let displayName: String
     nonisolated let glyph = ProviderGlyph.antigravity
 
-    /// The production host. Antigravity itself also calls a `daily-` variant,
-    /// which answers 403 to this token — so it is not a fallback, it is a
-    /// different audience.
-    private let endpoint = URL(string: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")!
-    /// The real usage figure — served by Cloud Code PA.
-    private let quotaEndpoint = URL(string: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!
-    private let prodQuotaEndpoint = URL(string: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")!
     private let session: URLSession
     /// A second session, trusting loopback only, for the local language server.
     private let localSession: URLSession
@@ -42,8 +35,16 @@ actor AntigravityProvider: UsageProvider {
     /// back to the request count then *replaces* a percentage with a plain
     /// number, and a ring that reads 8% one minute and 31 the next looks broken
     /// rather than degraded.
-    private var completionPausedUntil: Date = .distantPast
     private var everBridged = false
+    /// Cached official `agy -p /usage` windows so frequent background ticks do
+    /// not respawn the CLI every 30 seconds.
+    private var cachedCLIWindows: (windows: [LimitWindow], fetchedAt: Date)?
+    private var lastCLIFailureAt: Date?
+
+    /// Cache windows for official `agy -p /usage` invocations.
+    static let standardCLICacheTTL: TimeInterval = 5 * 60
+    static let liveCLICacheTTL: TimeInterval = 2 * 60
+    static let cliFailureCooldown: TimeInterval = 60
 
     /// How the language server is asked, when a test needs to say. Production
     /// leaves this nil and goes through `localQuota()`, which spawns `ps` and
@@ -51,15 +52,19 @@ actor AntigravityProvider: UsageProvider {
     /// nothing a test can arrange, and the ordering this fixes is exactly what
     /// would otherwise go uncovered.
     private let localQuotaOverride: (@Sendable () async -> [LimitWindow]?)?
+    /// Injectable official `agy -p /usage` fetcher for unit testing.
+    private let cliQuotaOverride: (@Sendable (AntigravityProfile) async throws -> [LimitWindow])?
 
     init(profile: AntigravityProfile = .default(),
          session: URLSession = .shared,
-         localQuota: (@Sendable () async -> [LimitWindow]?)? = nil) {
+         localQuota: (@Sendable () async -> [LimitWindow]?)? = nil,
+         cliQuota: (@Sendable (AntigravityProfile) async throws -> [LimitWindow])? = nil) {
         self.profile = profile
         self.id = profile.id
         self.displayName = profile.displayName
         self.session = session
         self.localQuotaOverride = localQuota
+        self.cliQuotaOverride = cliQuota
         self.localSession = URLSession(configuration: .ephemeral,
                                        delegate: LocalhostTrust(),
                                        delegateQueue: nil)
@@ -76,6 +81,15 @@ actor AntigravityProvider: UsageProvider {
     }
 
     nonisolated func account() -> ProviderAccount? {
+        if profile.isT3CodeProfile {
+            return ProviderAccount(
+                label: profile.accountHint ?? profile.displayName,
+                plan: "T3 Code",
+                source: profile.sourceName,
+                manageURL: URL(string: "https://antigravity.google")
+            )
+        }
+
         if AntigravityCredentials.isSignedIn(for: profile), let held = AntigravityCredentials.held(for: profile) {
             let email = held.email
             let plan = held.authMethod == "consumer" ? L10n.t("Personal") : held.authMethod
@@ -92,8 +106,8 @@ actor AntigravityProvider: UsageProvider {
             return ProviderAccount(
                 label: L10n.t("Local Session"),
                 plan: L10n.t("Active"),
-                source: "Antigravity IDE",
-                manageURL: nil
+                source: "agy CLI / Antigravity",
+                manageURL: URL(string: "https://antigravity.google")
             )
         }
 
@@ -101,40 +115,29 @@ actor AntigravityProvider: UsageProvider {
     }
 
     func fetchSnapshot() async throws -> ProviderSnapshot {
-        // Antigravity's own language server first, before anything is asked of
-        // the keychain. It already holds the credential and the client identity
-        // Google insists on, and answers with the same figure Antigravity's own
-        // panel shows — so where it is running, the token is not needed at all.
-        //
-        // It used to be asked third, after a keychain read and a round trip to
-        // `:loadCodeAssist`. That made the reading depend on a dialogue it did
-        // not need: someone who dismissed the keychain prompt got `accessDenied`
-        // and an empty ring, while the server that would have answered sat
-        // running on the same machine, never asked.
+        try await fetchSnapshot(freshness: .standard)
+    }
+
+    func fetchSnapshot(freshness: UsageFreshness) async throws -> ProviderSnapshot {
+        // 1. Default profile: if the Antigravity IDE language server is already
+        // running locally (or injected in tests), read its local loopback summary.
+        // Never calls Google's internal `v1internal` APIs directly.
         if profile.slug == nil {
             if let bridged = await localQuota(), !bridged.isEmpty {
                 everBridged = true
                 UserDefaults.standard.set(true, forKey: "AntigravityEverBridged")
-
-                // The language server's quota summary covers the groups it
-                // serves, which is not the whole account. Measured against one
-                // account: the server answered with the third-party group only,
-                // while Cloud Code PA answered with the Gemini group as well —
-                // and the Gemini group was where the usage actually was. Taking
-                // the server's answer as the account's would report a different
-                // allowance than the one asked for.
-                //
-                // So ask Cloud Code PA as well, but only when the answer so far
-                // cannot serve the family that was chosen. Where the server
-                // does report that family, nothing changes and the keychain is
-                // still never read.
-                let windows = await completedWindows(bridged) ?? bridged
-
-                let chosen = selection(for: windows)
-                return ProviderSnapshot(id: id, displayName: displayName, glyph: glyph,
-                                        fidelity: .official, status: .ok, windows: chosen.windows,
-                                        headlineID: chosen.headlineID,
-                                        weeklyID: chosen.weeklyID)
+                let preferred = Preferences.storedAntigravityHeadlineModel().rawValue
+                // If the local IDE server already covers the selected model family
+                // (or in unit tests with a mock localQuota), return it directly.
+                if localQuotaOverride != nil || bridged.contains(where: { $0.id.hasPrefix(preferred) }) {
+                    return officialSnapshot(bridged)
+                }
+                // Otherwise complete with official `agy -p /usage` (which returns
+                // both Gemini and Claude/GPT groups) without touching v1internal.
+                if let cliWindows = await fetchCLIQuota(freshness: freshness), !cliWindows.isEmpty {
+                    return officialSnapshot(Self.union(bridged, cliWindows))
+                }
+                return officialSnapshot(bridged)
             }
 
             if localQuotaOverride != nil && everBridged {
@@ -142,57 +145,32 @@ actor AntigravityProvider: UsageProvider {
             }
         }
 
-        if profile.slug != nil {
-            var credentials = try? AntigravityCredentials.load(for: profile)
-            if let creds = credentials, (creds.isExpired || creds.accessToken.isEmpty), creds.refreshToken != nil {
-                if let refreshed = try? await AntigravityCredentials.refresh(credentials: creds, session: session) {
-                    credentials = refreshed
-                    AntigravityCredentials.updateHeld(refreshed, for: profile)
-                }
+        // 2. Official `agy -p /usage --output-format json` path:
+        //    - For T3 Code profiles (and any profile with an `antigravity-oauth-token`),
+        //      runs `agy` in an isolated temporary HOME with AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1.
+        //    - For the default profile, runs `agy` against the ambient CLI sign-in.
+        //    Never calls `cloudcode-pa.googleapis.com/v1internal` or refreshes tokens directly.
+        if let cliWindows = await fetchCLIQuota(freshness: freshness), !cliWindows.isEmpty {
+            if profile.slug == nil {
+                everBridged = true
+                UserDefaults.standard.set(true, forKey: "AntigravityEverBridged")
             }
-            if let credentials,
-               let windows = try? await quota(token: credentials.accessToken,
-                                              project: credentials.projectId,
-                                              isACP: false),
-               !windows.isEmpty {
-                return officialSnapshot(windows)
-            }
-        } else {
-            let processTable = AntigravityBridge.run("/bin/ps", ["-Ao", "pid,command"])
-            let runningFlavors = AntigravityFlavor.runningFlavors(processTable: processTable)
-
-            // 1. Query token / credentials for each flavor: IDE, CLI, ACP
-            var candidates: [FlavorCandidate] = []
-            for flavor in AntigravityFlavor.allCases {
-                let isRunning = runningFlavors.contains(flavor)
-                let creds = try? AntigravityCredentials.load(for: flavor, profile: profile)
-                let lastActivity = flavor.lastActivityDate()
-                let canProvide = isRunning || (creds != nil && (!creds!.isExpired || creds!.refreshToken != nil))
-                let isActive = isRunning || (canProvide && (lastActivity != nil || (creds != nil && !creds!.isExpired)))
-                candidates.append(FlavorCandidate(
-                    flavor: flavor,
-                    credentials: creds,
-                    isRunning: isRunning,
-                    lastActivity: lastActivity,
-                    canProvideQuota: canProvide,
-                    isActive: isActive
-                ))
-            }
-
-            // 2. Only active ones get fetched from
-            let activeCandidates = candidates.filter { $0.isActive && $0.canProvideQuota }
-
-            // 3. If 2 or more are active, rank them to decide which one to fetch from
-            let ranked = AntigravityFlavor.rankCandidates(activeCandidates)
-
-            for candidate in ranked {
-                if let snapshot = await tryFetchQuota(for: candidate, processTable: processTable) {
-                    return snapshot
-                }
-            }
+            return officialSnapshot(cliWindows)
         }
 
-        // 4. Fallback to OMP SQLite store if offline or direct call fails
+        // If we had a recent official CLI reading and a manual/live refresh failed,
+        // keep the last good official reading rather than replacing percentages with
+        // a bare request count.
+        if let cached = cachedCLIWindows, !cached.windows.isEmpty {
+            let chosen = selection(for: cached.windows)
+            return ProviderSnapshot(id: id, displayName: displayName, glyph: glyph,
+                                    fidelity: .official, status: .stale(since: cached.fetchedAt),
+                                    windows: chosen.windows,
+                                    headlineID: chosen.headlineID,
+                                    weeklyID: chosen.weeklyID)
+        }
+
+        // 3. Fallback to OMP SQLite store if offline (read-only local DB, no network).
         if profile.slug == nil {
             let omp = Self.ompUsage(forEmail: AntigravityCredentials.held(for: profile)?.email)
             if !omp.windows.isEmpty {
@@ -210,7 +188,7 @@ actor AntigravityProvider: UsageProvider {
 
         if everBridged { throw UsageProviderError.credentialExpired }
 
-        // 5. Final fallback: request count activity from transcripts
+        // 4. Final fallback: local transcript request count (offline, no network).
         let roots = profile.slug == nil ? AntigravityActivity.transcriptRoots : [profile.brainDirectory]
         let activity = AntigravityActivity.read(roots: roots)
         return ProviderSnapshot(
@@ -228,69 +206,47 @@ actor AntigravityProvider: UsageProvider {
         )
     }
 
-    private func tryFetchQuota(for candidate: FlavorCandidate, processTable: String) async -> ProviderSnapshot? {
-        switch candidate.flavor {
-        case .ide:
-            // The IDE's language server was asked first, before any of this,
-            // and did not answer; asking it again here would only wait twice.
-            if let creds = candidate.credentials {
-                var activeCreds = creds
-                if (activeCreds.isExpired || activeCreds.accessToken.isEmpty) && activeCreds.refreshToken != nil {
-                    if let refreshed = try? await AntigravityCredentials.refresh(credentials: activeCreds, session: session) {
-                        activeCreds = refreshed
-                        AntigravityCredentials.updateHeld(refreshed, for: .ide, profile: profile)
-                    }
-                }
-                if !activeCreds.isExpired,
-                   let windows = try? await quota(token: activeCreds.accessToken, project: activeCreds.projectId, isACP: false),
-                   !windows.isEmpty {
-                    AntigravityCredentials.updateHeld(activeCreds, for: .ide, profile: profile)
-                    return officialSnapshot(windows)
-                }
+    private func fetchCLIQuota(freshness: UsageFreshness) async -> [LimitWindow]? {
+        let now = Date()
+        if freshness != .fromSource, let cached = cachedCLIWindows {
+            let ttl = freshness == .live ? Self.liveCLICacheTTL : Self.standardCLICacheTTL
+            if now.timeIntervalSince(cached.fetchedAt) < ttl {
+                return cached.windows
             }
-            return nil
+        }
+        if freshness != .fromSource, let failedAt = lastCLIFailureAt,
+           now.timeIntervalSince(failedAt) < Self.cliFailureCooldown {
+            return cachedCLIWindows?.windows
+        }
 
-        case .cli:
-            if candidate.isRunning, let bridge = AntigravityBridge.discover(processTable: processTable) {
-                if let windows = try? await AntigravityBridge.quota(from: bridge, session: localSession), !windows.isEmpty {
-                    everBridged = true
-                    UserDefaults.standard.set(true, forKey: "AntigravityEverBridged")
-                    return officialSnapshot(windows)
-                }
-            }
-            if let creds = candidate.credentials {
-                var activeCreds = creds
-                if (activeCreds.isExpired || activeCreds.accessToken.isEmpty) && activeCreds.refreshToken != nil {
-                    if let refreshed = try? await AntigravityCredentials.refresh(credentials: activeCreds, session: session) {
-                        activeCreds = refreshed
-                        AntigravityCredentials.updateHeld(refreshed, for: .cli, profile: profile)
-                    }
-                }
-                if !activeCreds.isExpired,
-                   let windows = try? await quota(token: activeCreds.accessToken, project: activeCreds.projectId, isACP: false),
-                   !windows.isEmpty {
-                    AntigravityCredentials.updateHeld(activeCreds, for: .cli, profile: profile)
-                    return officialSnapshot(windows)
-                }
-            }
-            return nil
+        let tokenURL = profile.cliTokenFileURL ?? {
+            guard profile.slug != nil else { return nil }
+            let candidate = profile.configDirectory.appendingPathComponent("antigravity-oauth-token")
+            return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        }()
 
-        case .acp:
-            if let creds = candidate.credentials {
-                var activeCreds = creds
-                if (activeCreds.isExpired || activeCreds.accessToken.isEmpty) && activeCreds.refreshToken != nil {
-                    if let refreshed = try? await AntigravityCredentials.refresh(credentials: activeCreds, session: session) {
-                        activeCreds = refreshed
-                        AntigravityCredentials.updateHeld(refreshed, for: .acp, profile: profile)
-                    }
-                }
-                if !activeCreds.isExpired,
-                   let windows = try? await quota(token: activeCreds.accessToken, project: activeCreds.projectId, isACP: true),
-                   !windows.isEmpty {
-                    AntigravityCredentials.updateHeld(activeCreds, for: .acp, profile: profile)
-                    return officialSnapshot(windows)
-                }
+        // Non-default profiles without a CLI token file cannot be queried via `agy`.
+        if profile.slug != nil && tokenURL == nil && cliQuotaOverride == nil {
+            return nil
+        }
+
+        do {
+            let windows: [LimitWindow]
+            if let cliQuotaOverride {
+                windows = try await cliQuotaOverride(profile)
+            } else {
+                windows = try await AntigravityCLIUsageFetcher.fetchWindows(tokenFileURL: tokenURL)
             }
+            guard !windows.isEmpty else {
+                lastCLIFailureAt = Date()
+                return nil
+            }
+            cachedCLIWindows = (windows, Date())
+            lastCLIFailureAt = nil
+            return windows
+        } catch {
+            lastCLIFailureAt = Date()
+            Log.usage.debug("Antigravity CLI usage failed for \(self.id, privacy: .public): \(String(describing: error), privacy: .public)")
             return nil
         }
     }
@@ -419,25 +375,10 @@ actor AntigravityProvider: UsageProvider {
         }
     }
 
-    /// Where to ask: the IDE's own server while it runs, otherwise one we start.
+    /// Only attaches to an already-running local IDE language server; never
+    /// spawns a standalone server or contacts Google's `v1internal` APIs directly.
     private func resolveEndpoint(processTable: String? = nil) async -> AntigravityBridge.Endpoint? {
-        if let running = AntigravityBridge.discover(processTable: processTable) { return running }
-
-        guard let binary = AntigravityBridge.serverBinaryURL(),
-              AntigravityBridge.owned.endpointOrStart(binary: binary) != nil,
-              let pid = AntigravityBridge.owned.pid
-        else { return nil }
-
-        for _ in 0..<40 {
-            let ports = AntigravityBridge.listeningPorts(ofPID: Int(pid))
-            if !ports.isEmpty {
-                AntigravityBridge.owned.resolvePorts(ports)
-                return AntigravityBridge.owned.current
-            }
-            try? await Task.sleep(for: .milliseconds(250))
-        }
-        Log.usage.debug("Antigravity: started server never bound a port")
-        return nil
+        AntigravityBridge.discover(processTable: processTable)
     }
 
     /// A reading from any official source, with the chosen family answered
@@ -450,44 +391,7 @@ actor AntigravityProvider: UsageProvider {
                                 weeklyID: chosen.weeklyID)
     }
 
-    /// Completes a language-server answer with the account's other quota
-    /// groups, when it is missing the one that was chosen.
-    ///
-    /// The server's summary is a subset: it reports the groups it serves, and
-    /// the family the reader picked can be among the ones it does not. The
-    /// direct Cloud Code PA answer is the whole account, so it is asked for
-    /// only when the subset cannot serve the chosen family — otherwise the
-    /// reading would fall through to a different allowance and say so by
-    /// displaying that allowance's name, which reads as an answer rather than
-    /// as a missing one.
-    ///
-    /// Returns nil when there is nothing to add or the direct answer cannot be
-    /// had, so the caller keeps what it already has.
-    private func completedWindows(_ bridged: [LimitWindow]) async -> [LimitWindow]? {
-        let preferred = Preferences.storedAntigravityHeadlineModel().rawValue
-        guard !bridged.contains(where: { $0.id.hasPrefix(preferred) }) else { return nil }
-        // An account that has no such group answers the same way every poll,
-        // and each try is a keychain read and a round trip to Google. So a try
-        // that could not help waits half an hour before the next.
-        let now = Date()
-        guard now >= completionPausedUntil else { return nil }
-        completionPausedUntil = now.addingTimeInterval(Self.completionPause)
-        guard let credentials = try? AntigravityCredentials.load(for: profile) else { return nil }
-        guard let direct = try? await quota(token: credentials.accessToken,
-                                            project: credentials.projectId),
-              !direct.isEmpty else { return nil }
-        if direct.contains(where: { $0.id.hasPrefix(preferred) }) {
-            completionPausedUntil = .distantPast
-        }
-        return Self.union(bridged, direct)
-    }
-
-    /// How long a completion that could not help waits before the next try.
-    static let completionPause: TimeInterval = 30 * 60
-
-    /// Union by id, the second answer winning. Measured, the direct answer is a
-    /// superset of the language server's, but a union loses nothing if that
-    /// stops being true.
+    /// Union by id, the second answer winning.
     static func union(_ first: [LimitWindow], _ second: [LimitWindow]) -> [LimitWindow] {
         var merged: [LimitWindow] = []
         var indexByID: [String: Int] = [:]
@@ -500,32 +404,6 @@ actor AntigravityProvider: UsageProvider {
             }
         }
         return merged
-    }
-
-    /// Ask for the account's quota, returning nil when it is not allowed to.
-    private func quota(token: String, project: String? = nil, isACP: Bool = false) async throws -> [LimitWindow]? {
-        let candidateEndpoints = isACP ? [prodQuotaEndpoint, quotaEndpoint] : [quotaEndpoint, prodQuotaEndpoint]
-        for url in candidateEndpoints {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let ua = isACP
-                ? "antigravity/acp/1.4.1 (aidev_client; os_type=darwin; arch=arm64; proxy_client=antigravity/sdk)"
-                : "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)"
-            request.setValue(ua, forHTTPHeaderField: "User-Agent")
-            request.setValue("ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI", forHTTPHeaderField: "Client-Metadata")
-            let bodyObj: [String: Any] = (project != nil && !project!.isEmpty) ? ["project": project!] : [:]
-            request.httpBody = try? JSONSerialization.data(withJSONObject: bodyObj)
-            request.timeoutInterval = 15
-
-            if let (data, response) = try? await session.data(for: request),
-               (response as? HTTPURLResponse)?.statusCode == 200 {
-                let parsed = Self.windows(in: data)
-                if !parsed.isEmpty { return parsed }
-            }
-        }
-        return nil
     }
 
     /// Turns a quota summary into standard limit windows.

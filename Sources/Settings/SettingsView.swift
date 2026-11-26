@@ -2217,7 +2217,7 @@ private struct AccountRow: View {
             accountDetail
             
             // Antigravity limit dropdown
-            if isConnected, provider.id == AntigravityProfile.defaultID {
+            if isConnected, AntigravityProfile.isAntigravity(providerID: provider.id) {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
                         Text(L10n.t("Notch reads"))

@@ -813,15 +813,22 @@ final class UsageStore: ObservableObject {
     }
 
     func reevaluate(providerID: String) {
-        guard let provider = providers.first(where: { $0.id == providerID }) else { return }
-        if let idx = snapshots.firstIndex(where: { $0.id == providerID }) {
+        let targetIDs: [String] = AntigravityProfile.isAntigravity(providerID: providerID)
+            ? providers.compactMap { ($0 is AntigravityProvider) ? $0.id : nil }
+            : [providerID]
+        var updated = false
+        for targetID in targetIDs {
+            guard let provider = providers.first(where: { $0.id == targetID }),
+                  let idx = snapshots.firstIndex(where: { $0.id == targetID }),
+                  let ag = provider as? AntigravityProvider else { continue }
             var snapshot = snapshots[idx]
-            if let ag = provider as? AntigravityProvider {
-                snapshot.headlineID = ag.resolveHeadlineID(for: snapshot.windows)
-                snapshot.weeklyID = ag.resolveWeeklyID(for: snapshot.windows)
-                snapshots[idx] = snapshot
-                updateNotchSnapshots()
-            }
+            snapshot.headlineID = ag.resolveHeadlineID(for: snapshot.windows)
+            snapshot.weeklyID = ag.resolveWeeklyID(for: snapshot.windows)
+            snapshots[idx] = snapshot
+            updated = true
+        }
+        if updated {
+            updateNotchSnapshots()
         }
     }
 
